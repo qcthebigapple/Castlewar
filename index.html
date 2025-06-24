@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Castle War Game</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: 'Comic Sans MS', cursive, sans-serif;
+            background: linear-gradient(135deg, #87CEEB, #98FB98);
+        }
+        
+        #gameContainer {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+        
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+            min-width: 200px;
+        }
+        
+        .castle-info {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 8px;
+            font-weight: bold;
+        }
+        
+        .player-castle {
+            background: rgba(0, 100, 255, 0.2);
+            border: 2px solid #0064ff;
+        }
+        
+        .ai-castle {
+            background: rgba(255, 0, 0, 0.2);
+            border: 2px solid #ff0000;
+        }
+        
+        #instructions {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            max-width: 300px;
+            font-size: 12px;
+        }
+        
+        #gameStatus {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            display: none;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.3);
+        }
+        
+        .victory {
+            color: #00aa00;
+        }
+        
+        .defeat {
+            color: #aa0000;
+        }
+        
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+        
+        button:hover {
+            background: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        
+        <div id="ui">
+            <h3>🏰 Castle War</h3>
+            <div class="castle-info player-castle">
+                <div>🔵 Your Castle</div>
+                <div>Soldiers: <span id="playerSoldiers">10</span></div>
+                <div>Growth: +<span id="playerGrowth">2</span>/sec</div>
+            </div>
+            <div class="castle-info ai-castle">
+                <div>🔴 AI Castle</div>
+                <div>Soldiers: <span id="aiSoldiers">10</span></div>
+                <div>Growth: +<span id="aiGrowth">2</span>/sec</div>
+            </div>
+            <div style="margin-top: 15px;">
+                <div>Selected: <span id="selectedLocation">None</span></div>
+                <div>Soldiers: <span id="selectedSoldiers">0</span></div>
+            </div>
+        </div>
+        
+        <div id="instructions">
+            <strong>How to Play:</strong><br>
+            • Click to select your castle or captured villages<br>
+            • Click another location to send 80% of your soldiers<br>
+            • Capture villages and the enemy castle to win<br>
+            • Watch soldiers march along routes and battle<br>
+        </div>
+        
+        <div id="gameStatus">
+            <div id="statusText"></div>
+            <button onclick="restartGame()">Play Again</button>
+        </div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // Game variables
+        let scene, camera, renderer, controls;
+        let gameObjects = {};
+        let selectedObject = null;
+        let gameState = 'playing'; // 'playing', 'victory', 'defeat'
+        let movingArmies = []; // Array to track moving soldier groups
+        let routeLines = []; // Array to track visual route lines
+        let roads = []; // Array to store road data
+        let roadGraph = {}; // Adjacency list for pathfinding
+        
+        // Game entities
+        const locations = {
+            playerCastle: {
+                position: [0, 0, 12],
+                soldiers: 100,
+                owner: 'player',
+                growthRate: 100,
+                type: 'castle',
+                maxSoldiers: 9999,
+                isUnderSiege: false
+            },
+            aiCastle: {
+                position: [0, 0, -12],
+                soldiers: 100,
+                owner: 'ai',
+                growthRate: 100,
+                type: 'castle',
+                maxSoldiers: 9999,
+                isUnderSiege: false
+            }
+        };
+
+        // Create 6 random villages
+        for (let i = 1; i <= 6; i++) {
+            locations[`village${i}`] = {
+                position: [(Math.random() - 0.5) * 20, 0, (Math.random() - 0.5) * 16],
+                soldiers: 200,
+                owner: 'neutral',
+                growthRate: 20,
+                type: 'village',
+                maxSoldiers: 5000,
+                isUnderSiege: false
+            };
+        }
+
+        // Initialize the game
+        function init() {
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            
+            // Camera setup
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 12, 12);
+            
+            // Renderer setup
+            const canvas = document.getElementById('gameCanvas');
+            renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 8;
+            controls.maxDistance = 25;
+            controls.maxPolarAngle = Math.PI / 2.2;
+            
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+            directionalLight.position.set(10, 20, 10);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 50;
+            directionalLight.shadow.camera.left = -20;
+            directionalLight.shadow.camera.right = 20;
+            directionalLight.shadow.camera.top = 20;
+            directionalLight.shadow.camera.bottom = -20;
+            scene.add(directionalLight);
+            
+            // Create ground
+            createGround();
+            
+            // Create game objects
+            createGameObjects();
+
+            // Create roads
+            createRoads();
+            
+            // Setup mouse interaction
+            setupMouseInteraction();
+            
+            // Start game loop
+            animate();
+            
+            // Start soldier growth
+            setInterval(growSoldiers, 1000);
+            
+            // AI behavior
+            setInterval(aiTurn, 3000);
+            
+            // Update moving armies
+            setInterval(updateMovingArmies, 100);
+            setInterval(updateSieges, 100);
+        }
+
+        function createGround() {
+            const groundGeometry = new THREE.PlaneGeometry(30, 30);
+            const groundMaterial = new THREE.MeshLambertMaterial({ 
+                color: 0x90EE90,
+                transparent: true,
+                opacity: 0.8
+            });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+            
+            // Add some decorative elements
+            for (let i = 0; i < 20; i++) {
+                const treeGeometry = new THREE.ConeGeometry(0.3, 1.5, 8);
+                const treeMaterial = new THREE.MeshLambertMaterial({ color: 0x228B22 });
+                const tree = new THREE.Mesh(treeGeometry, treeMaterial);
+                tree.position.set(
+                    (Math.random() - 0.5) * 25,
+                    0.75,
+                    (Math.random() - 0.5) * 25
+                );
+                tree.castShadow = true;
+                scene.add(tree);
+            }
+        }
+
+        function createCastle(position, color) {
+            const group = new THREE.Group();
+            
+            // Main castle body
+            const bodyGeometry = new THREE.BoxGeometry(2, 2, 2);
+            const bodyMaterial = new THREE.MeshLambertMaterial({ color: color });
+            const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+            body.position.y = 1;
+            body.castShadow = true;
+            group.add(body);
+            
+            // Castle towers
+            for (let i = 0; i < 4; i++) {
+                const towerGeometry = new THREE.CylinderGeometry(0.3, 0.3, 2.5, 8);
+                const tower = new THREE.Mesh(towerGeometry, bodyMaterial);
+                const angle = (i / 4) * Math.PI * 2;
+                tower.position.x = Math.cos(angle) * 1.2;
+                tower.position.z = Math.sin(angle) * 1.2;
+                tower.position.y = 1.25;
+                tower.castShadow = true;
+                group.add(tower);
+                
+                // Tower tops
+                const topGeometry = new THREE.ConeGeometry(0.4, 0.8, 8);
+                const topMaterial = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+                const top = new THREE.Mesh(topGeometry, topMaterial);
+                top.position.copy(tower.position);
+                top.position.y += 1.65;
+                top.castShadow = true;
+                group.add(top);
+            }
+            
+            group.position.set(...position);
+            return group;
+        }
+
+        function createVillage(position, color) {
+            const group = new THREE.Group();
+            
+            // Village house
+            const houseGeometry = new THREE.BoxGeometry(1, 1, 1);
+            const houseMaterial = new THREE.MeshLambertMaterial({ color: color });
+            const house = new THREE.Mesh(houseGeometry, houseMaterial);
+            house.position.y = 0.5;
+            house.castShadow = true;
+            group.add(house);
+            
+            // Roof
+            const roofGeometry = new THREE.ConeGeometry(0.8, 0.6, 4);
+            const roofMaterial = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+            const roof = new THREE.Mesh(roofGeometry, roofMaterial);
+            roof.position.y = 1.3;
+            roof.rotation.y = Math.PI / 4;
+            roof.castShadow = true;
+            group.add(roof);
+            
+            group.position.set(...position);
+            return group;
+        }
+
+        function createSoldier(position, color, scale = 1) {
+            const group = new THREE.Group();
+            
+            // Body
+            const bodyGeometry = new THREE.CylinderGeometry(0.1 * scale, 0.15 * scale, 0.4 * scale, 8);
+            const bodyMaterial = new THREE.MeshLambertMaterial({ color: color });
+            const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+            body.position.y = 0.2 * scale;
+            body.castShadow = true;
+            group.add(body);
+            
+            // Head
+            const headGeometry = new THREE.SphereGeometry(0.08 * scale, 8, 8);
+            const headMaterial = new THREE.MeshLambertMaterial({ color: 0xffdbac });
+            const head = new THREE.Mesh(headGeometry, headMaterial);
+            head.position.y = 0.48 * scale;
+            head.castShadow = true;
+            group.add(head);
+            
+            // Helmet
+            const helmetGeometry = new THREE.SphereGeometry(0.09 * scale, 8, 8);
+            const helmetMaterial = new THREE.MeshLambertMaterial({ color: color });
+            const helmet = new THREE.Mesh(helmetGeometry, helmetMaterial);
+            helmet.position.copy(head.position);
+            helmet.scale.set(1, 0.8, 1);
+            helmet.castShadow = true;
+            group.add(helmet);
+            
+            group.position.set(...position);
+            return group;
+        }
+
+        function createRoute(start, end, color) {
+            const startVec = new THREE.Vector3(...start);
+            const endVec = new THREE.Vector3(...end);
+            
+            const points = [startVec, endVec];
+            
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            const material = new THREE.LineBasicMaterial({ 
+                color: color, 
+                transparent: true, 
+                opacity: 0.6,
+                linewidth: 3 
+            });
+            
+            const line = new THREE.Line(geometry, material);
+            line.userData.isRoute = true;
+            return line;
+        }
+
+        function createRoads() {
+            const locationIds = Object.keys(locations);
+            const roadMaterial = new THREE.LineBasicMaterial({ color: 0x663300, linewidth: 2 });
+
+            for (let i = 0; i < locationIds.length; i++) {
+                for (let j = i + 1; j < locationIds.length; j++) {
+                    const id1 = locationIds[i];
+                    const id2 = locationIds[j];
+                    const pos1 = new THREE.Vector3(...locations[id1].position);
+                    const pos2 = new THREE.Vector3(...locations[id2].position);
+                    const distance = pos1.distanceTo(pos2);
+
+                    // Connect if distance is less than a threshold
+                    if (distance < 15) {
+                        const geometry = new THREE.BufferGeometry().setFromPoints([pos1, pos2]);
+                        const roadLine = new THREE.Line(geometry, roadMaterial);
+                        scene.add(roadLine);
+                        roads.push({ from: id1, to: id2 });
+
+                        // Build adjacency list for pathfinding
+                        if (!roadGraph[id1]) roadGraph[id1] = [];
+                        if (!roadGraph[id2]) roadGraph[id2] = [];
+                        roadGraph[id1].push(id2);
+                        roadGraph[id2].push(id1);
+                    }
+                }
+            }
+        }
+
+        function findShortestPath(startId, endId) {
+            const queue = [[startId]];
+            const visited = new Set([startId]);
+
+            while (queue.length > 0) {
+                const path = queue.shift();
+                const nodeId = path[path.length - 1];
+
+                if (nodeId === endId) {
+                    return path;
+                }
+
+                const neighbors = roadGraph[nodeId] || [];
+                for (const neighbor of neighbors) {
+                    if (!visited.has(neighbor)) {
+                        visited.add(neighbor);
+                        const newPath = [...path, neighbor];
+                        queue.push(newPath);
+                    }
+                }
+            }
+
+            return null; // No path found
+        }
+
+        function createGameObjects() {
+            for (const [id, location] of Object.entries(locations)) {
+                let color;
+                switch (location.owner) {
+                    case 'player': color = 0x0066ff; break;
+                    case 'ai': color = 0xff0000; break;
+                    default: color = 0x888888; break;
+                }
+                
+                let object;
+                if (location.type === 'castle') {
+                    object = createCastle(location.position, color);
+                } else {
+                    object = createVillage(location.position, color);
+                }
+                
+                object.userData = { id, location };
+                gameObjects[id] = object;
+                scene.add(object);
+                
+                // Add soldier counter text
+                createSoldierText(object, location.soldiers);
+            }
+        }
+
+        function createSoldierText(object, count) {
+            // Remove existing text
+            const existingText = object.children.find(child => child.userData.isText);
+            if (existingText) {
+                object.remove(existingText);
+            }
+            
+            // Create new text
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = 128;
+            canvas.height = 64;
+            
+            context.fillStyle = 'rgba(255, 255, 255, 0.9)';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.fillStyle = 'black';
+            context.font = 'bold 24px Arial';
+            context.textAlign = 'center';
+            context.fillText(Math.floor(count).toString(), canvas.width / 2, canvas.height / 2 + 8);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            const material = new THREE.SpriteMaterial({ map: texture });
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.set(2, 1, 1);
+            sprite.position.y = 3;
+            sprite.userData.isText = true;
+            
+            object.add(sprite);
+        }
+
+        function updateObjectAppearance(id) {
+            const location = locations[id];
+            const object = gameObjects[id];
+            
+            // Update color based on owner
+            let color;
+            switch (location.owner) {
+                case 'player': color = 0x0066ff; break;
+                case 'ai': color = 0xff0000; break;
+                default: color = 0x888888; break;
+            }
+            
+            object.children.forEach(child => {
+                if (child.material && !child.userData.isText) {
+                    child.material.color.setHex(color);
+                }
+            });
+            
+            // Update soldier count
+            createSoldierText(object, location.soldiers);
+            
+            // Update selection highlight
+            updateSelectionHighlight();
+        }
+
+        function setupMouseInteraction() {
+            const raycaster = new THREE.Raycaster();
+            const mouse = new THREE.Vector2();
+            
+            function onMouseClick(event) {
+                if (gameState !== 'playing') return;
+                
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                
+                raycaster.setFromCamera(mouse, camera);
+                
+                const objects = Object.values(gameObjects);
+                const intersects = raycaster.intersectObjects(objects, true);
+                
+                if (intersects.length > 0) {
+                    let targetObject = intersects[0].object;
+                    while (targetObject.parent && !targetObject.userData.id) {
+                        targetObject = targetObject.parent;
+                    }
+                    
+                    if (targetObject.userData && targetObject.userData.id) {
+                        handleLocationClick(targetObject.userData.id);
+                    }
+                }
+            }
+            
+            renderer.domElement.addEventListener('click', onMouseClick);
+        }
+
+        function handleLocationClick(locationId) {
+            const location = locations[locationId];
+            
+            if (!selectedObject) {
+                // Select if owned by player
+                if (location.owner === 'player') {
+                    selectedObject = locationId;
+                    updateSelectionHighlight();
+                    updateUI();
+                }
+            } else {
+                // Attack/move
+                if (selectedObject !== locationId) {
+                    startArmyMovement(selectedObject, locationId);
+                }
+                selectedObject = null;
+                updateSelectionHighlight();
+                updateUI();
+            }
+        }
+
+        function startArmyMovement(fromId, toId) {
+            const fromLocation = locations[fromId];
+            
+            if (fromLocation.owner !== 'player' || fromLocation.soldiers <= 1) return;
+
+            const path = findShortestPath(fromId, toId);
+            if (!path) return; // No path to target
+
+            const attackingSoldiers = Math.floor(fromLocation.soldiers * 0.8);
+            fromLocation.soldiers -= attackingSoldiers;
+            
+            // Create moving army
+            const army = {
+                id: `army_${Date.now()}`,
+                soldiers: attackingSoldiers,
+                owner: fromLocation.owner,
+                path: path,
+                currentSegment: 0,
+                progress: 0,
+                speed: 0.01,
+                soldierModels: [],
+                isBattling: false,
+                initialSoldiers: attackingSoldiers
+            };
+            
+            // Create soldier models for the army
+            for (let i = 0; i < Math.min(attackingSoldiers, 10); i++) {
+                const soldierColor = army.owner === 'player' ? 0x0066ff : 0xff0000;
+                const soldier = createSoldier([0, 0, 0], soldierColor, 0.8);
+                scene.add(soldier);
+                army.soldierModels.push(soldier);
+            }
+            
+            movingArmies.push(army);
+            updateObjectAppearance(fromId);
+            updateUI();
+        }
+
+        function updateMovingArmies() {
+            for (let i = movingArmies.length - 1; i >= 0; i--) {
+                const army = movingArmies[i];
+
+                if (army.isBattling) {
+                    const enemyArmy = army.battleTarget;
+                    if (!enemyArmy || enemyArmy.soldiers <= 0) {
+                        army.isBattling = false;
+                    } else {
+                        const damage = Math.max(army.initialSoldiers, enemyArmy.initialSoldiers) * 0.1 * (100 / 1000); // Per 100ms
+                        army.soldiers -= damage;
+
+                        if (army.soldiers <= 0) {
+                            removeArmy(army);
+                            if(enemyArmy) enemyArmy.isBattling = false;
+                            continue;
+                        }
+                    }
+                } else {
+                    army.progress += army.speed;
+
+                    if (army.progress >= 1) {
+                        army.currentSegment++;
+                        army.progress = 0;
+
+                        if (army.currentSegment >= army.path.length - 1) {
+                            completeArmyMovement(army);
+                            continue;
+                        }
+                    }
+                }
+
+                // This part should always run for all armies, battling or not, to update their visual position
+                const fromId = army.path[army.currentSegment];
+                const toId = army.path[army.currentSegment + 1];
+
+                if (fromId && toId) {
+                    const startPos = new THREE.Vector3(...locations[fromId].position);
+                    const endPos = new THREE.Vector3(...locations[toId].position);
+                    
+                    army.soldierModels.forEach((soldier, index) => {
+                        const offset = (index / army.soldierModels.length) * 0.05;
+                        const pos = new THREE.Vector3().lerpVectors(startPos, endPos, Math.max(0, army.progress - offset));
+                        soldier.position.copy(pos);
+                        
+                        // Add marching animation
+                        soldier.rotation.y = Math.sin(Date.now() * 0.01 + index) * 0.2;
+                        soldier.position.y += Math.abs(Math.sin(Date.now() * 0.02 + index)) * 0.1;
+                    });
+                }
+                
+                // Check for collisions with enemy armies
+                if (!army.isBattling) {
+                    checkArmyCollisions(army);
+                }
+            }
+        }
+
+        function checkArmyCollisions(army) {
+            // Only check collisions if army is still valid
+            if (!movingArmies.includes(army)) return;
+            
+            for (let other of movingArmies) {
+                if (other === army || other.owner === army.owner) continue;
+                
+                const armyPos = new THREE.Vector3();
+                const otherPos = new THREE.Vector3();
+                
+                if (army.soldierModels.length > 0 && other.soldierModels.length > 0) {
+                    armyPos.copy(army.soldierModels[0].position);
+                    otherPos.copy(other.soldierModels[0].position);
+                    
+                    // Only battle if armies are very close and heading to the same destination
+                    if (armyPos.distanceTo(otherPos) < 1.0 && army.toId === other.toId) {
+                        battleBetweenArmies(army, other);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        function battleBetweenArmies(army1, army2) {
+            if (army1.isBattling || army2.isBattling) return;
+
+            army1.isBattling = true;
+            army2.isBattling = true;
+            army1.battleTarget = army2;
+            army2.battleTarget = army1;
+
+            createBattleEffect(army1, army2);
+        }
+
+        function createBattleEffect(army1, army2) {
+            const battleEffectGroup = new THREE.Group();
+            scene.add(battleEffectGroup);
+
+            function animate() {
+                if (!army1.isBattling || !army2.isBattling) {
+                    scene.remove(battleEffectGroup);
+                    return;
+                }
+
+                // Move old particles
+                battleEffectGroup.children.forEach(p => {
+                    p.position.add(p.velocity);
+                    p.material.opacity *= 0.95;
+                    if (p.material.opacity < 0.05) {
+                        battleEffectGroup.remove(p);
+                    }
+                });
+
+                // Create new particles
+                for (let i = 0; i < 5; i++) {
+                    const sparkGeometry = new THREE.SphereGeometry(Math.random() * 0.1 + 0.05, 4, 4);
+                    const sparkMaterial = new THREE.MeshBasicMaterial({
+                        color: new THREE.Color(Math.random() > 0.5 ? 0xffff00 : 0xffa500),
+                        transparent: true,
+                        opacity: 0.9
+                    });
+                    const spark = new THREE.Mesh(sparkGeometry, sparkMaterial);
+                    spark.position.copy(army1.soldierModels[0].position).lerp(army2.soldierModels[0].position, 0.5);
+                    spark.velocity = new THREE.Vector3((Math.random() - 0.5) * 0.1, (Math.random() - 0.5) * 0.1, (Math.random() - 0.5) * 0.1);
+                    battleEffectGroup.add(spark);
+                }
+
+                requestAnimationFrame(animate);
+            }
+            animate();
+        }
+
+        function removeArmy(army) {
+            // Remove soldier models
+            army.soldierModels.forEach(soldier => {
+                scene.remove(soldier);
+            });
+            
+            // Remove from arrays
+            const armyIndex = movingArmies.indexOf(army);
+            if (armyIndex > -1) {
+                movingArmies.splice(armyIndex, 1);
+            }
+        }
+
+        function completeArmyMovement(army) {
+            // Check if the army still exists (wasn't destroyed in transit)
+            if (!movingArmies.includes(army)) {
+                return;
+            }
+            const toId = army.path[army.path.length - 1];
+            const toLocation = locations[toId];
+
+            if (toLocation.owner === army.owner) {
+                // Reinforcement
+                toLocation.soldiers += army.soldiers;
+                if (toLocation.isUnderSiege) {
+                    // Recalculate damage rate if reinforcing a besieged location
+                    let totalAttackingSoldiers = 0;
+                    toLocation.attackingArmies.forEach(army => totalAttackingSoldiers += army.soldiers);
+                    const average = (totalAttackingSoldiers + toLocation.soldiers) / 2;
+                    toLocation.damageRate = Math.max(10, Math.floor(average * 0.1));
+                }
+                removeArmy(army);
+            } else {
+                // Initiate or join siege
+                toLocation.isUnderSiege = true;
+                if (!toLocation.attackingArmies) {
+                    toLocation.attackingArmies = [];
+                }
+                toLocation.attackingArmies.push(army);
+                
+                // Recalculate damage rate
+                let totalAttackingSoldiers = 0;
+                toLocation.attackingArmies.forEach(a => totalAttackingSoldiers += a.soldiers);
+                const average = (totalAttackingSoldiers + toLocation.soldiers) / 2;
+                toLocation.damageRate = Math.max(10, Math.floor(average * 0.1));
+
+                createSiegeEffect(toLocation);
+            }
+
+            updateObjectAppearance(toId);
+            updateUI();
+        }
+
+        function updateSieges() {
+            for (const id in locations) {
+                const location = locations[id];
+                if (location.isUnderSiege && location.attackingArmies && location.attackingArmies.length > 0) {
+                    if (!location.damageRate) {
+                        let totalAttackingSoldiers = 0;
+                        location.attackingArmies.forEach(army => totalAttackingSoldiers += army.soldiers);
+                        const average = (totalAttackingSoldiers + location.soldiers) / 2;
+                        location.damageRate = Math.max(10, Math.floor(average * 0.1));
+                    }
+
+                    const damagePerInterval = location.damageRate * (100 / 1000);
+                    location.soldiers -= damagePerInterval;
+
+                    for(let i = location.attackingArmies.length - 1; i >= 0; i--) {
+                        const army = location.attackingArmies[i];
+                        army.soldiers -= damagePerInterval;
+                        if (army.soldiers <= 0) {
+                            removeArmy(army);
+                            location.attackingArmies.splice(i, 1);
+                        }
+                    }
+
+                    if (location.soldiers <= 0) {
+                        location.isUnderSiege = false;
+                        const winningArmy = location.attackingArmies.sort((a, b) => b.soldiers - a.soldiers)[0];
+                        if (winningArmy) {
+                            location.owner = winningArmy.owner;
+                            location.soldiers = 0;
+                            location.attackingArmies.forEach(army => location.soldiers += army.soldiers);
+                        }
+                        location.attackingArmies.forEach(army => removeArmy(army));
+                        location.attackingArmies = [];
+                        checkVictoryCondition();
+                    }
+                    
+                    if (location.attackingArmies.length === 0) {
+                        location.isUnderSiege = false;
+                    }
+                    
+                    updateObjectAppearance(id);
+                    updateUI();
+                }
+            }
+        }
+
+        function createSiegeEffect(location) {
+            const siegeEffectGroup = new THREE.Group();
+            scene.add(siegeEffectGroup);
+            siegeEffectGroup.position.copy(new THREE.Vector3(...location.position));
+
+            const ringCount = 3;
+            for (let i = 0; i < ringCount; i++) {
+                const geometry = new THREE.TorusGeometry(1.5 + i * 0.2, 0.05, 16, 100);
+                const material = new THREE.MeshBasicMaterial({ 
+                    color: 0xff0000, 
+                    transparent: true,
+                    opacity: 0.7 - i * 0.2
+                });
+                const torus = new THREE.Mesh(geometry, material);
+                torus.rotation.x = Math.PI / 2;
+                siegeEffectGroup.add(torus);
+            }
+
+            let siegeStartTime = Date.now();
+            function animateSiegeEffect() {
+                const t = (Date.now() - siegeStartTime) / 1000;
+                siegeEffectGroup.rotation.y = t * Math.PI;
+                if (location.isUnderSiege) {
+                    requestAnimationFrame(animateSiegeEffect);
+                } else {
+                    scene.remove(siegeEffectGroup);
+                }
+            }
+            animateSiegeEffect();
+        }
+
+        function aiTurn() {
+            if (gameState !== 'playing') return;
+            
+            const aiLocations = Object.entries(locations).filter(([id, loc]) => loc.owner === 'ai');
+            const playerLocations = Object.entries(locations).filter(([id, loc]) => loc.owner === 'player');
+            const neutralLocations = Object.entries(locations).filter(([id, loc]) => loc.owner === 'neutral');
+            
+            if (aiLocations.length === 0) return;
+            
+            // AI strategy: Attack weakest target or capture neutral villages
+            for (const [fromId, fromLoc] of aiLocations) {
+                if (fromLoc.soldiers <= 1) continue;
+                
+                const attackingSoldiers = Math.floor(fromLoc.soldiers / 2);
+                
+                // Find targets
+                const allTargets = [...playerLocations, ...neutralLocations];
+                const validTargets = allTargets.filter(([id, loc]) => attackingSoldiers > loc.soldiers);
+                
+                if (validTargets.length > 0) {
+                    // Attack weakest target
+                    validTargets.sort((a, b) => a[1].soldiers - b[1].soldiers);
+                    const [targetId, targetLoc] = validTargets[0];
+                    
+                    startAiArmyMovement(fromId, targetId);
+                    break;
+                }
+            }
+        }
+
+        function startAiArmyMovement(fromId, toId) {
+            const fromLocation = locations[fromId];
+            
+            if (fromLocation.owner !== 'ai' || fromLocation.soldiers <= 1) return;
+
+            const path = findShortestPath(fromId, toId);
+            if (!path) return; // No path to target
+
+            const attackingSoldiers = Math.floor(fromLocation.soldiers * 0.8);
+            fromLocation.soldiers -= attackingSoldiers;
+            
+            // Create route line
+            const fromPos = locations[fromId].position;
+            const toPos = locations[toId].position;
+            const route = createRoute(fromPos, toPos, 0xff0000);
+            scene.add(route);
+            routeLines.push(route);
+            
+            // Create moving army
+            const army = {
+                id: `ai_army_${Date.now()}`,
+                soldiers: attackingSoldiers,
+                owner: 'ai',
+                path: path,
+                currentSegment: 0,
+                progress: 0,
+                speed: 0.01,
+                soldierModels: [],
+                isBattling: false,
+                initialSoldiers: attackingSoldiers
+            };
+            
+            // Create soldier models for the army
+            for (let i = 0; i < Math.min(attackingSoldiers, 10); i++) {
+                const soldier = createSoldier([0, 0, 0], 0xff0000, 0.8);
+                scene.add(soldier);
+                army.soldierModels.push(soldier);
+            }
+            
+            movingArmies.push(army);
+            updateObjectAppearance(fromId);
+            updateUI();
+        }
+
+        function growSoldiers() {
+            if (gameState !== 'playing') return;
+            
+            for (const [id, location] of Object.entries(locations)) {
+                if (location.soldiers < location.maxSoldiers) {
+                    location.soldiers += location.growthRate;
+                    location.soldiers = Math.floor(Math.min(location.soldiers, location.maxSoldiers));
+                    updateObjectAppearance(id);
+                }
+            }
+            updateUI();
+        }
+
+        function updateSelectionHighlight() {
+            // Remove existing highlights
+            Object.values(gameObjects).forEach(obj => {
+                const highlight = obj.children.find(child => child.userData.isHighlight);
+                if (highlight) obj.remove(highlight);
+            });
+            
+            // Add highlight to selected object
+            if (selectedObject && gameObjects[selectedObject]) {
+                const geometry = new THREE.RingGeometry(2, 2.5, 16);
+                const material = new THREE.MeshBasicMaterial({ 
+                    color: 0xffff00, 
+                    transparent: true, 
+                    opacity: 0.7,
+                    side: THREE.DoubleSide
+                });
+                const highlight = new THREE.Mesh(geometry, material);
+                highlight.rotation.x = -Math.PI / 2;
+                highlight.position.y = 0.1;
+                highlight.userData.isHighlight = true;
+                gameObjects[selectedObject].add(highlight);
+            }
+        }
+
+        function updateUI() {
+            document.getElementById('playerSoldiers').textContent = Math.floor(locations.playerCastle.soldiers);
+            document.getElementById('playerGrowth').textContent = locations.playerCastle.growthRate;
+            document.getElementById('aiSoldiers').textContent = Math.floor(locations.aiCastle.soldiers);
+            document.getElementById('aiGrowth').textContent = locations.aiCastle.growthRate;
+            
+            if (selectedObject) {
+                const location = locations[selectedObject];
+                document.getElementById('selectedLocation').textContent = selectedObject;
+                document.getElementById('selectedSoldiers').textContent = Math.floor(location.soldiers);
+            } else {
+                document.getElementById('selectedLocation').textContent = 'None';
+                document.getElementById('selectedSoldiers').textContent = '0';
+            }
+        }
+
+        function checkVictoryCondition() {
+            if (locations.playerCastle.owner === 'ai') {
+                gameState = 'defeat';
+                showGameStatus('Defeat!', 'defeat');
+            } else if (locations.aiCastle.owner === 'player') {
+                gameState = 'victory';
+                showGameStatus('Victory!', 'victory');
+            }
+        }
+
+        function showGameStatus(text, type) {
+            const statusDiv = document.getElementById('gameStatus');
+            const statusText = document.getElementById('statusText');
+            statusText.textContent = text;
+            statusText.className = type;
+            statusDiv.style.display = 'block';
+        }
+
+        function restartGame() {
+            // Reset game state
+            gameState = 'playing';
+            selectedObject = null;
+            
+            // Clear moving armies
+            movingArmies.forEach(army => removeArmy(army));
+            movingArmies = [];
+            routeLines = [];
+            
+            // Reset locations
+            locations.playerCastle = {
+                position: [0, 0, 12],
+                soldiers: 100,
+                owner: 'player',
+                growthRate: 100,
+                type: 'castle',
+                maxSoldiers: 9999
+            };
+            locations.aiCastle = {
+                position: [0, 0, -12],
+                soldiers: 100,
+                owner: 'ai',
+                growthRate: 100,
+                type: 'castle',
+                maxSoldiers: 9999
+            };
+            for (let i = 1; i <= 6; i++) {
+                locations[`village${i}`].owner = 'neutral';
+                locations[`village${i}`].soldiers = 200;
+            }
+            
+            // Update all objects
+            Object.keys(locations).forEach(id => updateObjectAppearance(id));
+            
+            // Hide status
+            document.getElementById('gameStatus').style.display = 'none';
+            
+            updateUI();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.addEventListener('resize', onWindowResize);
+        window.restartGame = restartGame;
+
+        // Start the game
+        init();
+    </script>
+</body>
+</html>
