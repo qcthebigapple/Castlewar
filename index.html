@@ -100,6 +100,29 @@
         button:hover {
             background: #45a049;
         }
+
+        #armyPanel {
+            position:fixed;
+            right:10px;
+            top:50%;
+            transform:translateY(-50%);
+            background:rgba(0,0,0,0.7);
+            padding:10px;
+        }
+
+        #armyPanel h3 {
+            color:white;
+            margin-bottom:15px;
+        }
+
+        #armyList div {
+            color:white; /* Default color, overridden by JS */
+            margin-bottom:5px;
+        }
+
+        #armyList div:last-child {
+            margin-bottom:0;
+        }
     </style>
 </head>
 <body>
@@ -123,7 +146,12 @@
                 <div>Soldiers: <span id="selectedSoldiers">0</span></div>
             </div>
         </div>
-        
+
+        <div id="armyPanel">
+            <h3>Legions</h3>
+            <div id="armyList"></div>
+        </div>
+
         <div id="instructions">
             <strong>How to Play:</strong><br>
             • Click to select your castle or captured villages<br>
@@ -151,6 +179,13 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+        // Game configuration
+        const CONFIG = {
+            DESIRED_UNIT_SPEED_PER_SEC: 2, // Desired speed in Three.js units per second (10% of original 20)
+            BATTLE_TICK_INTERVAL: 100, // Battle calculation interval in ms (0.1 seconds)
+            MAX_ARMIES_DISPLAY: 10 // Max armies to show in the UI panel
+        };
+
         // Game variables
         let scene, camera, renderer, controls;
         let gameObjects = {};
@@ -170,7 +205,10 @@
                 growthRate: 100,
                 type: 'castle',
                 maxSoldiers: 9999,
-                isUnderSiege: false
+                isUnderSiege: false,
+                siegeAttacker: null, // The single army currently attacking this location
+                siegeDefenderInitialSoldiers: 0, // Initial soldiers of the defender when siege started
+                siegeQueue: [] // Queue of armies waiting to attack this location
             },
             aiCastle: {
                 position: [0, 0, -12],
@@ -179,21 +217,62 @@
                 growthRate: 100,
                 type: 'castle',
                 maxSoldiers: 9999,
-                isUnderSiege: false
+                isUnderSiege: false,
+                siegeAttacker: null,
+                siegeDefenderInitialSoldiers: 0,
+                siegeQueue: []
             }
         };
 
         // Create 6 random villages
+        const MIN_DISTANCE_BETWEEN_BUILDINGS = 8; // Minimum distance between buildings
         for (let i = 1; i <= 6; i++) {
-            locations[`village${i}`] = {
-                position: [(Math.random() - 0.5) * 20, 0, (Math.random() - 0.5) * 16],
-                soldiers: 200,
-                owner: 'neutral',
-                growthRate: 20,
-                type: 'village',
-                maxSoldiers: 5000,
-                isUnderSiege: false
-            };
+            let newPosition;
+            let isValidPosition = false;
+            let attempts = 0;
+            while (!isValidPosition && attempts < 100) { // Limit attempts to prevent infinite loops
+                newPosition = [(Math.random() - 0.5) * 20, 0, (Math.random() - 0.5) * 16];
+                isValidPosition = true;
+                // Check against castles
+                for (const castleId of ['playerCastle', 'aiCastle']) {
+                    const castlePos = new THREE.Vector3(...locations[castleId].position);
+                    const newVec = new THREE.Vector3(...newPosition);
+                    if (newVec.distanceTo(castlePos) < MIN_DISTANCE_BETWEEN_BUILDINGS) {
+                        isValidPosition = false;
+                        break;
+                    }
+                }
+                // Check against existing villages
+                if (isValidPosition) {
+                    for (let j = 1; j < i; j++) { // Only check against already created villages
+                        const existingVillagePos = new THREE.Vector3(...locations[`village${j}`].position);
+                        const newVec = new THREE.Vector3(...newPosition);
+                        if (newVec.distanceTo(existingVillagePos) < MIN_DISTANCE_BETWEEN_BUILDINGS) {
+                            isValidPosition = false;
+                            break;
+                        }
+                    }
+                }
+                attempts++;
+            }
+
+            if (isValidPosition) {
+                locations[`village${i}`] = {
+                    position: newPosition,
+                    soldiers: 200,
+                    owner: 'neutral',
+                    growthRate: 20,
+                    type: 'village',
+                    maxSoldiers: 2000,
+                    isUnderSiege: false,
+                    siegeAttacker: null,
+                    siegeDefenderInitialSoldiers: 0,
+                    siegeQueue: []
+                };
+            } else {
+                console.warn(`Could not find a valid position for village${i} after ${attempts} attempts. Skipping.`);
+                // Optionally, you could place it at a default safe position or reduce the number of villages
+            }
         }
 
         // Initialize the game
@@ -260,8 +339,8 @@
             setInterval(aiTurn, 3000);
             
             // Update moving armies
-            setInterval(updateMovingArmies, 100);
-            setInterval(updateSieges, 100);
+            setInterval(updateMovingArmies, CONFIG.BATTLE_TICK_INTERVAL);
+            setInterval(updateSieges, CONFIG.BATTLE_TICK_INTERVAL);
         }
 
         function createGround() {
@@ -403,32 +482,120 @@
         }
 
         function createRoads() {
+            const roadTexture = createRoadTexture();
+            roadTexture.wrapS = THREE.RepeatWrapping;
+            roadTexture.wrapT = THREE.RepeatWrapping;
+
+            const roadMaterial = new THREE.MeshStandardMaterial({
+                map: roadTexture,
+                roughness: 0.8,
+                metalness: 0.2,
+                side: THREE.DoubleSide
+            });
+
             const locationIds = Object.keys(locations);
-            const roadMaterial = new THREE.LineBasicMaterial({ color: 0x663300, linewidth: 2 });
+            const castles = locationIds.filter(id => locations[id].type === 'castle');
+            const villages = locationIds.filter(id => locations[id].type === 'village');
 
-            for (let i = 0; i < locationIds.length; i++) {
-                for (let j = i + 1; j < locationIds.length; j++) {
-                    const id1 = locationIds[i];
-                    const id2 = locationIds[j];
-                    const pos1 = new THREE.Vector3(...locations[id1].position);
-                    const pos2 = new THREE.Vector3(...locations[id2].position);
-                    const distance = pos1.distanceTo(pos2);
+            const connected = new Set();
 
-                    // Connect if distance is less than a threshold
-                    if (distance < 15) {
-                        const geometry = new THREE.BufferGeometry().setFromPoints([pos1, pos2]);
-                        const roadLine = new THREE.Line(geometry, roadMaterial);
-                        scene.add(roadLine);
-                        roads.push({ from: id1, to: id2 });
+            function addRoad(id1, id2) {
+                const sortedIds = [id1, id2].sort().join('-');
+                if (connected.has(sortedIds)) return;
 
-                        // Build adjacency list for pathfinding
-                        if (!roadGraph[id1]) roadGraph[id1] = [];
-                        if (!roadGraph[id2]) roadGraph[id2] = [];
-                        roadGraph[id1].push(id2);
-                        roadGraph[id2].push(id1);
+                const pos1 = new THREE.Vector3(...locations[id1].position);
+                const pos2 = new THREE.Vector3(...locations[id2].position);
+                const distance = pos1.distanceTo(pos2);
+
+                const roadWidth = 1.0; // Adjust as needed
+                const roadGeometry = new THREE.PlaneGeometry(distance, roadWidth);
+                const roadMesh = new THREE.Mesh(roadGeometry, roadMaterial);
+
+                // Position the road between the two points
+                roadMesh.position.copy(pos1).lerp(pos2, 0.5);
+                roadMesh.position.y = 0.01; // Lift road slightly above ground
+                roadMesh.rotation.x = -Math.PI / 2; // Lay it flat on the ground
+
+                // Orient the road to point from pos1 to pos2
+                const angle = Math.atan2(pos2.z - pos1.z, pos2.x - pos1.x);
+                roadMesh.rotation.z = -angle; // Rotate around Y (which is now Z after X rotation)
+
+                // Adjust texture repetition based on road length
+                roadTexture.repeat.set(distance / roadWidth, 1);
+
+                roadMesh.receiveShadow = true;
+                scene.add(roadMesh);
+                roads.push({ from: id1, to: id2, mesh: roadMesh });
+
+                if (!roadGraph[id1]) roadGraph[id1] = [];
+                if (!roadGraph[id2]) roadGraph[id2] = [];
+                roadGraph[id1].push(id2);
+                roadGraph[id2].push(id1);
+                connected.add(sortedIds);
+            }
+
+            castles.forEach(castleId => {
+                const castlePos = new THREE.Vector3(...locations[castleId].position);
+                const sortedVillages = villages
+                    .map(villageId => ({ id: villageId, distance: new THREE.Vector3(...locations[villageId].position).distanceTo(castlePos) }))
+                    .sort((a, b) => a.distance - b.distance);
+
+                if (sortedVillages.length > 0) addRoad(castleId, sortedVillages[0].id);
+                if (sortedVillages.length > 1) addRoad(castleId, sortedVillages[1].id);
+            });
+
+            if (villages.length > 1) {
+                const villagesToConnect = new Set(villages);
+                const connectedVillages = new Set();
+                const startVillage = villages[0];
+                connectedVillages.add(startVillage);
+                villagesToConnect.delete(startVillage);
+
+                while (villagesToConnect.size > 0) {
+                    let nearestEdge = { from: null, to: null, distance: Infinity };
+                    connectedVillages.forEach(fromId => {
+                        const fromPos = new THREE.Vector3(...locations[fromId].position);
+                        villagesToConnect.forEach(toId => {
+                            const toPos = new THREE.Vector3(...locations[toId].position);
+                            const distance = fromPos.distanceTo(toPos);
+                            if (distance < nearestEdge.distance) {
+                                nearestEdge = { from: fromId, to: toId, distance: distance };
+                            }
+                        });
+                    });
+
+                    if (nearestEdge.to) {
+                        addRoad(nearestEdge.from, nearestEdge.to);
+                        connectedVillages.add(nearestEdge.to);
+                        villagesToConnect.delete(nearestEdge.to);
+                    } else {
+                        break;
                     }
                 }
             }
+        }
+
+        function createRoadTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const context = canvas.getContext('2d');
+
+            // Simple mud color
+            context.fillStyle = '#6B4423'; // Darker brown
+            context.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Add some subtle variations for a muddy look
+            for (let i = 0; i < 50; i++) {
+                const x = Math.random() * canvas.width;
+                const y = Math.random() * canvas.height;
+                const size = Math.random() * 5 + 2;
+                const shade = Math.floor(Math.random() * 30);
+                context.fillStyle = `rgb(${107 + shade}, ${68 + shade}, ${35 + shade})`;
+                context.fillRect(x, y, size, size);
+            }
+
+            return new THREE.CanvasTexture(canvas);
         }
 
         function findShortestPath(startId, endId) {
@@ -606,9 +773,9 @@
                 path: path,
                 currentSegment: 0,
                 progress: 0,
-                speed: 0.01,
                 soldierModels: [],
                 isBattling: false,
+                isSieging: false, // Add isSieging property
                 initialSoldiers: attackingSoldiers
             };
             
@@ -623,72 +790,120 @@
             movingArmies.push(army);
             updateObjectAppearance(fromId);
             updateUI();
+            updateArmyDisplay();
         }
 
         function updateMovingArmies() {
+            const updateIntervalSeconds = CONFIG.BATTLE_TICK_INTERVAL / 1000;
+            const distancePerTick = CONFIG.DESIRED_UNIT_SPEED_PER_SEC * updateIntervalSeconds;
+
             for (let i = movingArmies.length - 1; i >= 0; i--) {
                 const army = movingArmies[i];
 
+                // Handle movement logic first
+                if (!army.isBattling && !army.isSieging) {
+                    const fromId = army.path[army.currentSegment];
+                    const toId = army.path[army.currentSegment + 1];
+
+                    if (fromId && toId) {
+                        const startPos = new THREE.Vector3(...locations[fromId].position);
+                        const endPos = new THREE.Vector3(...locations[toId].position);
+                        const segmentLength = startPos.distanceTo(endPos);
+                        
+                        if (segmentLength > 0) {
+                            army.progress += distancePerTick / segmentLength;
+                        }
+                    }
+                    
+                    if (army.progress >= 1) {
+                        const currentNodeId = army.path[army.currentSegment + 1]; // The node the army just reached
+                        const currentNodeLocation = locations[currentNodeId];
+                        const isFinalDestination = army.currentSegment + 1 >= army.path.length - 1;
+                        const isHostileIntermediate = currentNodeLocation && currentNodeLocation.owner !== army.owner && !isFinalDestination;
+
+                        if (isHostileIntermediate) {
+                            // Stop at this hostile intermediate node and attempt to siege
+                            completeArmyMovement(army, true);
+                            continue; 
+                        } else if (isFinalDestination) {
+                            // Reached final destination
+                            completeArmyMovement(army);
+                            continue;
+                        } else {
+                            // Arrived at a friendly intermediate stop. Pass through.
+                            army.currentSegment++;
+                            army.progress = 0;
+                        }
+                    }
+                }
+
+                // Handle battle logic (for wilderness battles)
                 if (army.isBattling) {
                     const enemyArmy = army.battleTarget;
                     if (!enemyArmy || enemyArmy.soldiers <= 0) {
                         army.isBattling = false;
+                        army.battleTarget = null;
+                        army.battleDamageRate = 0;
                     } else {
-                        const damage = Math.max(army.initialSoldiers, enemyArmy.initialSoldiers) * 0.1 * (100 / 1000); // Per 100ms
-                        army.soldiers -= damage;
+                        const damagePerTick = army.battleDamageRate * (CONFIG.BATTLE_TICK_INTERVAL / 1000);
+                        army.soldiers -= damagePerTick;
+                        enemyArmy.soldiers -= damagePerTick;
 
                         if (army.soldiers <= 0) {
+                            const victoriousEnemy = army.battleTarget;
                             removeArmy(army);
-                            if(enemyArmy) enemyArmy.isBattling = false;
-                            continue;
-                        }
-                    }
-                } else {
-                    army.progress += army.speed;
-
-                    if (army.progress >= 1) {
-                        army.currentSegment++;
-                        army.progress = 0;
-
-                        if (army.currentSegment >= army.path.length - 1) {
-                            completeArmyMovement(army);
+                            if(victoriousEnemy) {
+                                victoriousEnemy.isBattling = false;
+                                victoriousEnemy.battleTarget = null;
+                                victoriousEnemy.battleDamageRate = 0;
+                            }
                             continue;
                         }
                     }
                 }
 
-                // This part should always run for all armies, battling or not, to update their visual position
-                const fromId = army.path[army.currentSegment];
-                const toId = army.path[army.currentSegment + 1];
+                // Update visual position for all non-sieging armies
+                if (!army.isSieging) {
+                    const currentFromId = army.path[army.currentSegment];
+                    const currentToId = army.path[army.currentSegment + 1];
 
-                if (fromId && toId) {
-                    const startPos = new THREE.Vector3(...locations[fromId].position);
-                    const endPos = new THREE.Vector3(...locations[toId].position);
-                    
-                    army.soldierModels.forEach((soldier, index) => {
-                        const offset = (index / army.soldierModels.length) * 0.05;
-                        const pos = new THREE.Vector3().lerpVectors(startPos, endPos, Math.max(0, army.progress - offset));
-                        soldier.position.copy(pos);
+                    if (currentFromId && currentToId) {
+                        const currentStartPos = new THREE.Vector3(...locations[currentFromId].position);
+                        const currentEndPos = new THREE.Vector3(...locations[currentToId].position);
                         
-                        // Add marching animation
-                        soldier.rotation.y = Math.sin(Date.now() * 0.01 + index) * 0.2;
-                        soldier.position.y += Math.abs(Math.sin(Date.now() * 0.02 + index)) * 0.1;
-                    });
+                        army.soldierModels.forEach((soldier, index) => {
+                            const offset = (index / army.soldierModels.length) * 0.05;
+                            const pos = new THREE.Vector3().lerpVectors(currentStartPos, currentEndPos, Math.max(0, army.progress - offset));
+                            soldier.position.copy(pos);
+                            
+                            soldier.rotation.y = Math.sin(Date.now() * 0.01 + index) * 0.2;
+                            soldier.position.y = 0.01 + Math.abs(Math.sin(Date.now() * 0.02 + index)) * 0.1;
+                        });
+                    }
+                } else { // If sieging, keep soldiers at the target location
+                    const siegedLocationId = army.path[army.currentSegment];
+                    const targetLocation = locations[siegedLocationId];
+                    if (targetLocation) {
+                        const basePos = new THREE.Vector3(...targetLocation.position);
+                        army.soldierModels.forEach((soldier, index) => {
+                            const offset = new THREE.Vector3((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
+                            soldier.position.copy(basePos).add(offset);
+                        });
+                    }
                 }
-                
-                // Check for collisions with enemy armies
-                if (!army.isBattling) {
+
+                // Check for new collisions (only if not already battling or sieging)
+                if (!army.isBattling && !army.isSieging) {
                     checkArmyCollisions(army);
                 }
             }
         }
 
         function checkArmyCollisions(army) {
-            // Only check collisions if army is still valid
-            if (!movingArmies.includes(army)) return;
+            if (!movingArmies.includes(army) || army.isBattling) return;
             
             for (let other of movingArmies) {
-                if (other === army || other.owner === army.owner) continue;
+                if (other === army || other.owner === army.owner || other.isBattling) continue;
                 
                 const armyPos = new THREE.Vector3();
                 const otherPos = new THREE.Vector3();
@@ -697,8 +912,8 @@
                     armyPos.copy(army.soldierModels[0].position);
                     otherPos.copy(other.soldierModels[0].position);
                     
-                    // Only battle if armies are very close and heading to the same destination
-                    if (armyPos.distanceTo(otherPos) < 1.0 && army.toId === other.toId) {
+                    // Check if armies are close enough to battle
+                    if (armyPos.distanceTo(otherPos) < 1.0) { // Threshold for collision
                         battleBetweenArmies(army, other);
                         break;
                     }
@@ -714,7 +929,18 @@
             army1.battleTarget = army2;
             army2.battleTarget = army1;
 
+            // Store initial soldier counts for damage calculation
+            army1.initialBattleSoldiers = army1.soldiers;
+            army2.initialBattleSoldiers = army2.soldiers;
+            
+            const largerInitialForce = Math.max(army1.initialBattleSoldiers, army2.initialBattleSoldiers);
+
+            // Calculate damage rate (20% of larger initial force per second)
+            army1.battleDamageRate = Math.floor(largerInitialForce * 0.2); // Per second
+            army2.battleDamageRate = Math.floor(largerInitialForce * 0.2); // Per second
+
             createBattleEffect(army1, army2);
+            console.log(`Wilderness battle started between army ${army1.id} (${army1.owner}) and ${army2.id} (${army2.owner}).`);
         }
 
         function createBattleEffect(army1, army2) {
@@ -766,121 +992,224 @@
             if (armyIndex > -1) {
                 movingArmies.splice(armyIndex, 1);
             }
+            updateArmyDisplay(); // Update display after removing army
         }
 
-        function completeArmyMovement(army) {
+        function completeArmyMovement(army, isIntermediateStop = false) {
             // Check if the army still exists (wasn't destroyed in transit)
             if (!movingArmies.includes(army)) {
                 return;
             }
-            const toId = army.path[army.path.length - 1];
+            
+            const toId = isIntermediateStop ? army.path[army.currentSegment + 1] : army.path[army.path.length - 1];
             const toLocation = locations[toId];
 
             if (toLocation.owner === army.owner) {
                 // Reinforcement
-                toLocation.soldiers += army.soldiers;
                 if (toLocation.isUnderSiege) {
-                    // Recalculate damage rate if reinforcing a besieged location
-                    let totalAttackingSoldiers = 0;
-                    toLocation.attackingArmies.forEach(army => totalAttackingSoldiers += army.soldiers);
-                    const average = (totalAttackingSoldiers + toLocation.soldiers) / 2;
-                    toLocation.damageRate = Math.max(10, Math.floor(average * 0.1));
+                    toLocation.soldiers += army.soldiers;
+                    if (army.isSieging) {
+                        army.isSieging = false;
+                        army.soldierModels.forEach(s => scene.remove(s));
+                    }
+                    console.log(`Friendly army ${army.id} reinforced besieged ${toLocation.id}. New defender count: ${toLocation.soldiers}`);
+                    if (toLocation.siegeAttacker) {
+                        const largerInitialForce = Math.max(toLocation.siegeAttacker.initialSoldiers, toLocation.soldiers);
+                        toLocation.siegeDamageRate = Math.floor(largerInitialForce * 0.1);
+                    }
+                } else {
+                    toLocation.soldiers += army.soldiers;
+                    console.log(`Friendly army ${army.id} reinforced ${toLocation.id}. New soldier count: ${toLocation.soldiers}`);
                 }
                 removeArmy(army);
             } else {
-                // Initiate or join siege
-                toLocation.isUnderSiege = true;
-                if (!toLocation.attackingArmies) {
-                    toLocation.attackingArmies = [];
-                }
-                toLocation.attackingArmies.push(army);
-                
-                // Recalculate damage rate
-                let totalAttackingSoldiers = 0;
-                toLocation.attackingArmies.forEach(a => totalAttackingSoldiers += a.soldiers);
-                const average = (totalAttackingSoldiers + toLocation.soldiers) / 2;
-                toLocation.damageRate = Math.max(10, Math.floor(average * 0.1));
+                // Arrived at enemy/neutral location
+                if (toLocation.isUnderSiege) {
+                    toLocation.siegeQueue.push(army);
+                    army.isSieging = true;
+                    army.progress = 0; // Stop movement
+                    army.currentSegment = army.path.indexOf(toId); // Keep at current node
+                    const endPos = new THREE.Vector3(...toLocation.position);
+                    army.soldierModels.forEach(soldier => {
+                        const offset = new THREE.Vector3((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
+                        soldier.position.copy(endPos).add(offset);
+                    });
+                    console.log(`Army ${army.id} queued for siege at ${toLocation.id}.`);
+                } else {
+                    toLocation.isUnderSiege = true;
+                    toLocation.siegeAttacker = army;
+                    army.isSieging = true;
+                    army.progress = 0; // Stop movement
+                    army.currentSegment = army.path.indexOf(toId); // Keep at current node
+                    toLocation.siegeDefenderInitialSoldiers = toLocation.soldiers;
+                    
+                    const initialAttackerForce = army.soldiers;
+                    const initialDefenderForce = toLocation.soldiers;
+                    const largerInitialForce = Math.max(initialAttackerForce, initialDefenderForce);
+                    toLocation.siegeDamageRate = Math.floor(largerInitialForce * 0.1);
 
-                createSiegeEffect(toLocation);
+                    createSiegeEffect(toLocation);
+                    console.log(`Siege started at ${toLocation.id} by army ${army.id}. Initial defender: ${toLocation.siegeDefenderInitialSoldiers}, damage rate: ${toLocation.siegeDamageRate}/s.`);
+                }
             }
 
             updateObjectAppearance(toId);
             updateUI();
+            updateArmyDisplay();
         }
 
         function updateSieges() {
             for (const id in locations) {
                 const location = locations[id];
-                if (location.isUnderSiege && location.attackingArmies && location.attackingArmies.length > 0) {
-                    if (!location.damageRate) {
-                        let totalAttackingSoldiers = 0;
-                        location.attackingArmies.forEach(army => totalAttackingSoldiers += army.soldiers);
-                        const average = (totalAttackingSoldiers + location.soldiers) / 2;
-                        location.damageRate = Math.max(10, Math.floor(average * 0.1));
-                    }
 
-                    const damagePerInterval = location.damageRate * (100 / 1000);
-                    location.soldiers -= damagePerInterval;
+                if (location.isUnderSiege && location.siegeAttacker) {
+                    // Active siege battle
+                    const attackerArmy = location.siegeAttacker;
 
-                    for(let i = location.attackingArmies.length - 1; i >= 0; i--) {
-                        const army = location.attackingArmies[i];
-                        army.soldiers -= damagePerInterval;
-                        if (army.soldiers <= 0) {
-                            removeArmy(army);
-                            location.attackingArmies.splice(i, 1);
-                        }
-                    }
+                    // Calculate damage for this tick (0.1 seconds)
+                    const damagePerTick = location.siegeDamageRate * (CONFIG.BATTLE_TICK_INTERVAL / 1000);
 
-                    if (location.soldiers <= 0) {
+                    // Apply damage
+                    location.soldiers -= damagePerTick;
+                    attackerArmy.soldiers -= damagePerTick;
+
+                    // Update soldier count display for battling armies
+                    attackerArmy.soldierModels.forEach(s => s.visible = attackerArmy.soldiers > 0);
+
+                    // Check if attacker is defeated
+                    if (attackerArmy.soldiers <= 0) {
+                        console.log(`Attacker army ${attackerArmy.id} defeated at ${location.id}.`);
+                        removeArmy(attackerArmy); // Remove from moving armies
                         location.isUnderSiege = false;
-                        const winningArmy = location.attackingArmies.sort((a, b) => b.soldiers - a.soldiers)[0];
-                        if (winningArmy) {
-                            location.owner = winningArmy.owner;
-                            location.soldiers = 0;
-                            location.attackingArmies.forEach(army => location.soldiers += army.soldiers);
+                        location.siegeAttacker = null;
+                        // Clear siege effect
+                        if (location.siegeEffect) {
+                            scene.remove(location.siegeEffect.group);
+                            location.siegeEffect = null;
                         }
-                        location.attackingArmies.forEach(army => removeArmy(army));
-                        location.attackingArmies = [];
+                        console.log(`Siege at ${location.id} ended. Defenders win.`);
+                        // Process next in queue
+                        processNextSiegeInQueue(location);
+                    }
+                    // Check if defender is defeated
+                    else if (location.soldiers <= 0) {
+                        console.log(`Defender at ${location.id} defeated by army ${attackerArmy.id}.`);
+                        location.owner = attackerArmy.owner;
+                        location.soldiers = attackerArmy.soldiers; // Remaining attacker soldiers become new garrison
+                        removeArmy(attackerArmy); // Remove from moving armies
+                        location.isUnderSiege = false;
+                        location.siegeAttacker = null;
+                        // Clear siege effect
+                        if (location.siegeEffect) {
+                            scene.remove(location.siegeEffect.group);
+                            location.siegeEffect = null;
+                        }
+                        console.log(`Siege at ${location.id} ended. Attacker wins.`);
                         checkVictoryCondition();
+                        // Process next in queue
+                        processNextSiegeInQueue(location);
                     }
-                    
-                    if (location.attackingArmies.length === 0) {
-                        location.isUnderSiege = false;
-                    }
-                    
+
                     updateObjectAppearance(id);
-                    updateUI();
                 }
+            }
+            updateUI();
+            updateArmyDisplay();
+        }
+
+        function processNextSiegeInQueue(location) {
+            if (location.siegeQueue.length > 0) {
+                const nextArmy = location.siegeQueue.shift();
+                console.log(`Processing next army ${nextArmy.id} from siege queue at ${location.id}.`);
+                // Re-initiate siege with this army
+                location.isUnderSiege = true;
+                location.siegeAttacker = nextArmy;
+                nextArmy.isSieging = true; // Set isSieging to true
+                location.siegeDefenderInitialSoldiers = location.soldiers; // New initial defender count
+                
+                const initialAttackerForce = nextArmy.soldiers;
+                const initialDefenderForce = location.soldiers;
+                const largerInitialForce = Math.max(initialAttackerForce, initialDefenderForce);
+                location.siegeDamageRate = Math.floor(largerInitialForce * 0.1); // 10% per second
+
+                // The army will remain at the location, no further movement needed.
+                // Its visual position is already fixed by completeArmyMovement when it joined the queue.
+
+                createSiegeEffect(location); // Update siege visual
             }
         }
 
         function createSiegeEffect(location) {
+            // If an effect already exists, just update its soldiers
+            if (location.siegeEffect) {
+                // Remove old soldiers and add new ones based on current siegeAttacker
+                location.siegeEffect.soldiers.forEach(s => location.siegeEffect.group.remove(s));
+                location.siegeEffect.soldiers = [];
+
+                if (location.siegeAttacker) {
+                    const army = location.siegeAttacker;
+                    const soldierColor = army.owner === 'player' ? 0x0066ff : 0xff0000;
+                    const numSoldiers = Math.min(Math.floor(army.soldiers / 10), CONFIG.MAX_ARMIES_DISPLAY); // Show 1 soldier per 10, max 10
+                    for (let i = 0; i < numSoldiers; i++) {
+                        const soldier = createSoldier([0,0,0], soldierColor, 0.7);
+                        soldier.userData.armyId = army.id;
+                        location.siegeEffect.group.add(soldier);
+                        location.siegeEffect.soldiers.push(soldier);
+                    }
+                }
+                return;
+            }
+
             const siegeEffectGroup = new THREE.Group();
             scene.add(siegeEffectGroup);
             siegeEffectGroup.position.copy(new THREE.Vector3(...location.position));
-
-            const ringCount = 3;
-            for (let i = 0; i < ringCount; i++) {
-                const geometry = new THREE.TorusGeometry(1.5 + i * 0.2, 0.05, 16, 100);
-                const material = new THREE.MeshBasicMaterial({ 
-                    color: 0xff0000, 
-                    transparent: true,
-                    opacity: 0.7 - i * 0.2
-                });
-                const torus = new THREE.Mesh(geometry, material);
-                torus.rotation.x = Math.PI / 2;
-                siegeEffectGroup.add(torus);
+            
+            const soldiers = [];
+            if (location.siegeAttacker) {
+                const army = location.siegeAttacker;
+                const soldierColor = army.owner === 'player' ? 0x0066ff : 0xff0000;
+                const numSoldiers = Math.min(Math.floor(army.soldiers / 10), CONFIG.MAX_ARMIES_DISPLAY); // Show 1 soldier per 10, max 10
+                for (let i = 0; i < numSoldiers; i++) {
+                    const soldier = createSoldier([0,0,0], soldierColor, 0.7);
+                    soldier.userData.armyId = army.id;
+                    siegeEffectGroup.add(soldier);
+                    soldiers.push(soldier);
+                }
             }
 
-            let siegeStartTime = Date.now();
+            location.siegeEffect = {
+                group: siegeEffectGroup,
+                soldiers: soldiers,
+                startTime: Date.now()
+            };
+
             function animateSiegeEffect() {
-                const t = (Date.now() - siegeStartTime) / 1000;
-                siegeEffectGroup.rotation.y = t * Math.PI;
-                if (location.isUnderSiege) {
-                    requestAnimationFrame(animateSiegeEffect);
-                } else {
-                    scene.remove(siegeEffectGroup);
+                if (!location.isUnderSiege || !location.siegeEffect || !location.siegeAttacker || location.siegeAttacker.soldiers <= 0) {
+                    if (location.siegeEffect) scene.remove(location.siegeEffect.group);
+                    location.siegeEffect = null;
+                    return;
                 }
+
+                const t = (Date.now() - location.siegeEffect.startTime) * 0.001;
+                const radius = 2.0;
+
+                location.siegeEffect.soldiers.forEach((soldier, i) => {
+                    const angle = (i / location.siegeEffect.soldiers.length) * Math.PI * 2 + t * 0.5;
+                    soldier.position.x = Math.cos(angle) * radius;
+                    soldier.position.z = Math.sin(angle) * radius;
+                    
+                    // Look at the center
+                    soldier.lookAt(new THREE.Vector3(0,0,0));
+
+                    // Simple attack animation
+                    const attackCycle = (t * 2 + i * 0.5) % 1;
+                    if (attackCycle < 0.2) {
+                        soldier.position.x *= 0.9;
+                        soldier.position.z *= 0.9;
+                    }
+                });
+
+                requestAnimationFrame(animateSiegeEffect);
             }
             animateSiegeEffect();
         }
@@ -898,17 +1227,28 @@
             for (const [fromId, fromLoc] of aiLocations) {
                 if (fromLoc.soldiers <= 1) continue;
                 
-                const attackingSoldiers = Math.floor(fromLoc.soldiers / 2);
+                const attackingSoldiers = Math.floor(fromLoc.soldiers * 0.8); // AI commits 80% of its soldiers
                 
-                // Find targets
-                const allTargets = [...playerLocations, ...neutralLocations];
-                const validTargets = allTargets.filter(([id, loc]) => attackingSoldiers > loc.soldiers);
-                
-                if (validTargets.length > 0) {
-                    // Attack weakest target
-                    validTargets.sort((a, b) => a[1].soldiers - b[1].soldiers);
-                    const [targetId, targetLoc] = validTargets[0];
-                    
+                // Prioritize neutral villages that are not owned by AI
+                const neutralVillagesToTarget = neutralLocations.filter(([id, loc]) => loc.owner !== 'ai');
+
+                if (neutralVillagesToTarget.length > 0) {
+                    // Attack the closest neutral village
+                    neutralVillagesToTarget.sort((a, b) => {
+                        const distA = new THREE.Vector3(...locations[fromId].position).distanceTo(new THREE.Vector3(...a[1].position));
+                        const distB = new THREE.Vector3(...locations[fromId].position).distanceTo(new THREE.Vector3(...b[1].position));
+                        return distA - distB;
+                    });
+                    const [targetId, targetLoc] = neutralVillagesToTarget[0];
+                    startAiArmyMovement(fromId, targetId);
+                    break; // Only send one army per AI turn for simplicity
+                }
+
+                // If no neutral villages, attack weakest player location
+                const playerTargets = playerLocations.filter(([id, loc]) => loc.owner !== 'ai');
+                if (playerTargets.length > 0) {
+                    playerTargets.sort((a, b) => a[1].soldiers - b[1].soldiers);
+                    const [targetId, targetLoc] = playerTargets[0];
                     startAiArmyMovement(fromId, targetId);
                     break;
                 }
@@ -941,9 +1281,9 @@
                 path: path,
                 currentSegment: 0,
                 progress: 0,
-                speed: 0.01,
                 soldierModels: [],
                 isBattling: false,
+                isSieging: false, // Add isSieging property
                 initialSoldiers: attackingSoldiers
             };
             
@@ -957,19 +1297,22 @@
             movingArmies.push(army);
             updateObjectAppearance(fromId);
             updateUI();
+            updateArmyDisplay();
         }
 
         function growSoldiers() {
             if (gameState !== 'playing') return;
             
             for (const [id, location] of Object.entries(locations)) {
-                if (location.soldiers < location.maxSoldiers) {
+                // Only grow if not under siege and not at max soldiers
+                if (!location.isUnderSiege && location.soldiers < location.maxSoldiers) {
                     location.soldiers += location.growthRate;
-                    location.soldiers = Math.floor(Math.min(location.soldiers, location.maxSoldiers));
+                    location.soldiers = Math.floor(Math.min(location.soldiers, location.maxSoldiers)); // Cap growth at maxSoldiers
                     updateObjectAppearance(id);
                 }
             }
             updateUI();
+            updateArmyDisplay();
         }
 
         function updateSelectionHighlight() {
@@ -994,6 +1337,17 @@
                 highlight.userData.isHighlight = true;
                 gameObjects[selectedObject].add(highlight);
             }
+        }
+
+        function updateArmyDisplay() {
+            const container = document.getElementById('armyList');
+            container.innerHTML = movingArmies
+                .slice(0, CONFIG.MAX_ARMIES_DISPLAY)
+                .map(army => 
+                    `<div style="color:${army.owner === 'player' ? '#0066ff' : '#ff0000'};">
+                        🪖 ${army.soldiers.toFixed(0)}人 (${(army.progress * 100).toFixed(0)}%)
+                    </div>`
+                ).join('');
         }
 
         function updateUI() {
@@ -1047,7 +1401,11 @@
                 owner: 'player',
                 growthRate: 100,
                 type: 'castle',
-                maxSoldiers: 9999
+                maxSoldiers: 9999,
+                isUnderSiege: false,
+                siegeAttacker: null,
+                siegeDefenderInitialSoldiers: 0,
+                siegeQueue: []
             };
             locations.aiCastle = {
                 position: [0, 0, -12],
@@ -1055,11 +1413,19 @@
                 owner: 'ai',
                 growthRate: 100,
                 type: 'castle',
-                maxSoldiers: 9999
+                maxSoldiers: 9999,
+                isUnderSiege: false,
+                siegeAttacker: null,
+                siegeDefenderInitialSoldiers: 0,
+                siegeQueue: []
             };
             for (let i = 1; i <= 6; i++) {
                 locations[`village${i}`].owner = 'neutral';
                 locations[`village${i}`].soldiers = 200;
+                locations[`village${i}`].isUnderSiege = false;
+                locations[`village${i}`].siegeAttacker = null;
+                locations[`village${i}`].siegeDefenderInitialSoldiers = 0;
+                locations[`village${i}`].siegeQueue = [];
             }
             
             // Update all objects
@@ -1069,6 +1435,7 @@
             document.getElementById('gameStatus').style.display = 'none';
             
             updateUI();
+            updateArmyDisplay();
         }
 
         function animate() {
